@@ -1,0 +1,36 @@
+# 仮想環境・キャッシュ
+.venv/
+__pycache__/
+*.pyc
+
+# OS・エディタ
+.DS_Store
+.vscode/
+.idea/
+
+# FileMaker のデータベースとログ(個人データ・ローカルのパスが入る)
+*.fmp12
+*.fmp12-*
+*.fmpur
+Import.log
+Export.log
+*.log
+
+# モデルの重みと生成物(大きい。convert.py と build_vision_model.py で再生成できる)
+*.pt
+*.pth
+*.onnx
+*.mlmodel
+*.mlpackage/
+*.mlpackage
+weights/
+
+# テスト用の画像(サイズが大きく、権利関係も不明確)
+Gemini_Generated_Image_*.jpeg
+*.jpg
+*.jpeg
+*.png
+
+# Claude Code のローカル設定
+.claude/
+.mcp.json
