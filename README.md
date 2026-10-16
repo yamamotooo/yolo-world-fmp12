@@ -130,7 +130,7 @@ python verify_samples.py                                  # 読み取りの検�
 python card_lookup.py samples/*.webp                      # 読み取り + 価格取得
 ```
 
-`requests` が必要。`samples/` は、検証用のカード画像と、同名の `.json`(ハレルヤの商品データ。`title` が `名前(レアリティ){タイプ}〈番号〉[セット記号]`)。権利関係が不明確なので、git には入れない想定。
+`requests` が必要。`samples/` は、検証用のカード画像と、同名の `.json`(正解データ。`title` が `名前(レアリティ){タイプ}〈番号〉[セット記号]`)。権利関係が不明確なので、git には入れない想定。
 
 ### FileMaker の操作と draw_boxes.html の関数
 
@@ -195,7 +195,6 @@ python card_lookup.py samples/*.webp                      # 読み取り + 価�
 ### 検討したが採用しなかったもの
 
 - **Pokemon Price Tracker**: 日本語カードは引けるが、収録の最新が M2a(2025-11-28)で、M6a と MF がなかった。課金が「返したカード数」で、`limit=5` の検索で 5 クレジット消費する(無料枠 100/日)。
-- **Hareruya2(ハレルヤ)**: Shopify 製で、商品ページの `.json` は取れる。`robots.txt` が `/search` を禁止していて、検索 API は使えない(日本以外からは `417 Unsupported buyer locale` も返る)。`.json` には、レアリティと番号の独立したフィールドがなく、タイトルの `()` や `〈〉` から取り出す必要がある。`[MF]` や `[M6a]` はセット記号。
 
 ### 注意点
 
