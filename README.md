@@ -2,6 +2,12 @@
 
 YOLO-World(ゼロショット物体検出)でトランプのカードを検出し、FileMaker から座標を取得して描画する。
 
+## 画面
+
+FileMaker の Web ビューアに、検出した枠を描いたところ(左: iOS、右: Mac)。
+
+<img src="iOS.png" alt="iOS(FileMaker Go)での表示" width="260"> <img src="PC.png" alt="Mac(FileMaker Pro)での表示" width="360">
+
 ## 構成
 
 | ファイル | 役割 |
