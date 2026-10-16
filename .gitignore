@@ -34,3 +34,12 @@ Gemini_Generated_Image_*.jpeg
 # Claude Code のローカル設定
 .claude/
 .mcp.json
+
+# API キーなどの秘密情報(雛形は .env.example)
+.env
+
+# 検証用のカード画像と商品データ(ショップの画像で、権利関係が不明確)
+samples/
+
+# 実写の検証用写真
+test/

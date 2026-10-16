@@ -7,8 +7,17 @@
 <style>
   body { margin: 0; font: 13px -apple-system, sans-serif; background: #222; color: #eee; }
   #tools { padding: 8px; display: none; }
-  #tools textarea { width: 100%; height: 80px; box-sizing: border-box; }
-  canvas { display: block; max-width: 100%; height: auto; }
+  #tools textarea { width: 100%; height: 80px; box-sizing: border-box; display: block; margin: 4px 0; }
+  #tools input[type=password] { width: 100%; box-sizing: border-box; display: block; margin: 2px 0; }
+  canvas { display: block; max-width: 100%; height: auto; cursor: pointer; }
+  #bar { position: fixed; left: 8px; bottom: 8px; padding: 4px 10px; border-radius: 12px; background: rgba(0,0,0,.75); display: none; }
+  #pop { position: fixed; z-index: 10; display: none; width: 260px; box-sizing: border-box; padding: 10px 14px 10px;
+         background: #111; color: #eee; border: 3px solid #888; border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,.6); line-height: 1.55; }
+  #pop .x { position: absolute; top: 0; right: 10px; font-size: 22px; cursor: pointer; }
+  #pop h3 { margin: 0 16px 4px 0; font-size: 16px; }
+  #pop .price { font-size: 20px; font-weight: bold; }
+  #pop .sub { color: #aaa; font-size: 12px; }
+  #pop .warn { color: #ffd24d; }
 </style>
 </head>
 <body>
@@ -17,18 +26,37 @@
   <input type="file" id="file" accept="image/*">
   <textarea id="json" placeholder="ComputeModel の結果 (JSON) を貼り付け"></textarea>
   <button id="run">描画</button>
+  <input type="password" id="uiGemini" placeholder="Gemini API キー (このページの中だけで使う)">
+  <input type="password" id="uiPokewallet" placeholder="PokéWallet API キー">
+  <button id="lookup">カード情報を取得</button>
+  <button id="dump">JSON を表示</button>
+  <button id="selftest">接続テスト</button>
+  <textarea id="out" placeholder="getJSON() の結果"></textarea>
+  <textarea id="info" placeholder='setCardInfo の引数 (JSON) 例: [{"index":0,"name":"ピカチュウ","number":"050/153","rarity":"C","price":120}]'></textarea>
+  <button id="apply">情報を反映</button>
+  <button id="crops">切り出しを確認</button>
+  <div id="cropview"></div>
 </div>
 <canvas id="c"></canvas>
+<div id="bar"></div>
+<div id="pop"></div>
 <script type="application/json" id="result">__JSON__</script>
 <script type="text/plain" id="image">__IMAGE__</script>
+<script type="text/plain" id="geminiKey">__GEMINI_API_KEY__</script>
+<script type="text/plain" id="pokewalletKey">__POKEWALLET_API_KEY__</script>
+<script type="text/plain" id="geminiModel">__GEMINI_MODEL__</script>
 <script>
-// FileMaker で、上の2つの script タグ内のプレースホルダ(アンダースコア2つで囲んだ IMAGE と JSON)を Substitute する。
+// FileMaker で、上のタグ内のプレースホルダ(アンダースコア2つで囲んだ名前)を Substitute する。
 // ここ(コメント内)にはプレースホルダを書かないこと。Substitute は全て置換するので、コードが壊れる。
 // IMAGE は "data:image/jpeg;base64,..."、JSON は ComputeModel の結果(JSON 配列)。
 // Base64Encode は 76 文字ごとに改行を入れるので、文字列リテラルではなくタグに入れ、空白を取り除いて使う。
+// API キーと、GEMINI_MODEL(置換しない、または空なら既定のモデル)も、同じタグ方式。
 const IMAGE = document.getElementById("image").textContent.replace(/\s+/g, "");
 const RESULT = document.getElementById("result").textContent;
-const MIN_PROB = 0.25;   // これ未満の確率のラベルは無視 (有効なラベルは 0.5)
+const MIN_PROB = 0.25;         // これ未満の確率のラベルは無視 (有効なラベルは 0.5)
+const MIN_CONFIDENCE = 0.8;    // Gemini の読み取り信頼度がこれ未満なら、価格を取らない
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const CALLBACK_SCRIPT = "callback";   // getJSON() で JSON を渡す FileMaker のスクリプト名
 
 // --- parse: [{classification:"0:x1:0.595", confidence:0.5}, ...] -> [{x1,y1,x2,y2,c}, ...] ---
 function parseCards(result) {
@@ -44,32 +72,350 @@ function parseCards(result) {
     .map(j => cards[j]).filter(c => ["x1", "y1", "x2", "y2"].every(k => k in c));
 }
 
+// --- 状態 ---
+// cards: 検出した枠 (表示の向きの正規化座標)。records: カードごとの取得結果 (getJSON で返す)。info: 枠の下に重ねる表示用。
+const STATE = { img: null, cards: [], records: [], info: {} };
+let RUN = { state: "idle", total: 0, done: 0, error: "", rate: null };
+
+function initRecords() {
+  STATE.records = STATE.cards.map((c, i) => ({
+    index: i, box: { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: c.c ?? null },
+    read: null, match: null, price: null, status: "pending", note: "",
+  }));
+}
+
 // --- draw: 座標は 0〜1 の正規化値 ---
 const COLORS = ["#ff4d4d", "#4dff88", "#4da6ff", "#ffd24d", "#d94dff", "#4dffff", "#ff944d", "#b3ff4d", "#ff4da6", "#a6a6ff"];
-function draw(img, cards) {
+
+function draw() {
+  const { img, cards, info } = STATE;
   const cv = document.getElementById("c");
   cv.width = img.naturalWidth; cv.height = img.naturalHeight;
   const g = cv.getContext("2d");
   g.drawImage(img, 0, 0);
   const lw = Math.max(2, Math.round(cv.width / 300));
-  g.lineWidth = lw; g.font = `bold ${Math.max(12, Math.round(cv.width / 40))}px sans-serif`;
+  const fs = Math.max(12, Math.round(cv.width / 40));
+  g.lineWidth = lw; g.font = `bold ${fs}px sans-serif`;
   cards.forEach((c, i) => {
     const x = c.x1 * cv.width, y = c.y1 * cv.height;
     const w = (c.x2 - c.x1) * cv.width, h = (c.y2 - c.y1) * cv.height;
     g.strokeStyle = g.fillStyle = COLORS[i % COLORS.length];
     g.strokeRect(x, y, w, h);
     const label = `${i}` + (c.c !== undefined ? ` ${c.c.toFixed(2)}` : "");
-    const tw = g.measureText(label).width + 8, th = parseInt(g.font.match(/\d+/)[0]) + 6;
+    const tw = g.measureText(label).width + 8, th = fs + 6;
     g.fillRect(x, Math.max(0, y - th), tw, th);
     g.fillStyle = "#000"; g.fillText(label, x + 4, Math.max(th - 6, y - 6));
+    if (info[i]) drawInfo(g, info[i], x, y + h, w, fs, COLORS[i % COLORS.length]);
   });
 }
 
+// カード情報を枠の下端に重ねる。price が無ければ「要確認」
+function drawInfo(g, it, x, yBottom, w, fs, color) {
+  const price = typeof it.price === "number" ? `¥${it.price.toLocaleString()}` : "要確認";
+  const lines = [it.name, [it.number, it.rarity].filter(Boolean).join(" "), price].filter(Boolean);
+  const lh = fs + 4;
+  g.font = `bold ${fs}px sans-serif`;
+  const bw = Math.min(w, Math.max(...lines.map(s => g.measureText(s).width)) + 12);
+  const top = yBottom - lh * lines.length - 6;
+  g.fillStyle = "rgba(0,0,0,0.75)"; g.fillRect(x, top, bw, lh * lines.length + 6);
+  g.fillStyle = color;
+  lines.forEach((s, k) => g.fillText(s, x + 6, top + lh * (k + 1) - 2, bw - 8));
+}
+
+// --- EXIF の向き ---
+// FileMaker の ComputeModel は EXIF の向きを無視して、回転前の画素で推論する。一方、ブラウザは EXIF を反映して描く。
+// そのため、iPhone の縦撮りの写真(向き 6 など)では、モデルが返す座標は「回転前の画像」の座標になり、描画とずれる。
+// ここで EXIF の向きを読み取り、座標を表示と同じ向きに変換する。
+function exifOrientation(dataUrl) {
+  try {
+    const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1, dataUrl.indexOf(",") + 1 + 87384);   // 先頭 64KB 分 (4 の倍数)
+    const s = atob(b64), u8 = Uint8Array.from(s, c => c.charCodeAt(0)), dv = new DataView(u8.buffer);
+    if (dv.getUint16(0) !== 0xFFD8) return 1;                                    // JPEG ではない
+    for (let p = 2; p + 4 < u8.length;) {
+      const marker = dv.getUint16(p), len = dv.getUint16(p + 2);
+      if (marker === 0xFFE1 && dv.getUint32(p + 4) === 0x45786966) {            // APP1 "Exif"
+        const t = p + 10, le = dv.getUint16(t) === 0x4949;
+        const ifd = t + dv.getUint32(t + 4, le), n = dv.getUint16(ifd, le);
+        for (let i = 0; i < n; i++) {
+          const e = ifd + 2 + i * 12;
+          if (dv.getUint16(e, le) === 0x0112) return dv.getUint16(e + 8, le);   // Orientation
+        }
+        return 1;
+      }
+      if ((marker & 0xFF00) !== 0xFF00 || marker === 0xFFDA) return 1;
+      p += 2 + len;
+    }
+  } catch (e) { /* 読めなければ向きなしとして扱う */ }
+  return 1;
+}
+
+// 回転前の画像の正規化座標 (x, y) -> 表示向きの座標
+const ORIENT = {
+  1: (x, y) => [x, y],         2: (x, y) => [1 - x, y],     3: (x, y) => [1 - x, 1 - y], 4: (x, y) => [x, 1 - y],
+  5: (x, y) => [y, x],         6: (x, y) => [1 - y, x],     7: (x, y) => [1 - y, 1 - x], 8: (x, y) => [y, 1 - x],
+};
+function toDisplay(cards, orientation) {
+  const f = ORIENT[orientation] || ORIENT[1];
+  return cards.map(c => {
+    const [ax, ay] = f(c.x1, c.y1), [bx, by] = f(c.x2, c.y2);
+    return { ...c, x1: Math.min(ax, bx), y1: Math.min(ay, by), x2: Math.max(ax, bx), y2: Math.max(ay, by) };
+  });
+}
+
+// ボタン 1: 写真から枠を表示する。取得は始めない。
 function render(src, result) {
   const img = new Image();
-  img.onload = () => draw(img, parseCards(result));
+  img.onload = () => {
+    STATE.img = img; STATE.info = {};
+    STATE.cards = toDisplay(parseCards(result), exifOrientation(src));
+    RUN = { state: "idle", total: 0, done: 0, error: "", rate: null };
+    initRecords(); hidePopup(); showBar(); draw();
+  };
   img.src = src;
 }
+
+// --- 切り出し ---
+// margin: 枠の外側に足す余白 (枠の幅・高さに対する割合)。傾いたカードの角が欠けないように取る。
+// maxSide: 長辺の上限(px)。送信サイズを抑える。
+function cropCard(c, margin = 0.08, maxSide = 1024) {
+  const img = STATE.img, W = img.naturalWidth, H = img.naturalHeight;
+  const mx = (c.x2 - c.x1) * margin, my = (c.y2 - c.y1) * margin;
+  const sx = Math.max(0, (c.x1 - mx) * W), sy = Math.max(0, (c.y1 - my) * H);
+  const sw = Math.min(W, (c.x2 + mx) * W) - sx, sh = Math.min(H, (c.y2 + my) * H) - sy;
+  const k = Math.min(1, maxSide / Math.max(sw, sh));
+  const cv = document.createElement("canvas");
+  cv.width = Math.round(sw * k); cv.height = Math.round(sh * k);
+  cv.getContext("2d").drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+  return cv.toDataURL("image/jpeg", 0.9);
+}
+
+// --- 外部 API ---
+const GEMINI_PROMPT = `これはポケモンカード(日本語版)1枚の画像です。印字されている内容だけを読み取ってください。推測や補完はしないこと。
+- name_ja: カード名 (ex などの接尾辞を含む。「LV.12」などは含めない)
+- name_en: 英語名 (ポケモン名の公式英語名。トレーナーズ等で不明なら空文字)
+- set_code: 左下付近の角丸の枠内に入った、英数字のセット記号 (例 M6a, MF)。単独の「J」は言語マークなのでセット記号ではない。無ければ空文字
+- number: カード番号 (例 019/103)。無ければ空文字
+- rarity_mark: 番号の右に印字されたレアリティ記号 (RR, SR, AR など)。セット記号は含めない。印字が無ければ空文字
+- confidence: 0〜1。番号やセット記号が読みにくいときは下げる`;
+const GEMINI_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    name_ja: { type: "STRING" }, name_en: { type: "STRING" }, set_code: { type: "STRING" },
+    number: { type: "STRING" }, rarity_mark: { type: "STRING" }, confidence: { type: "NUMBER" },
+  },
+  required: ["name_ja", "name_en", "set_code", "number", "rarity_mark", "confidence"],
+};
+
+// 429 / 5xx は少し待って再試行する。失敗時のメッセージにキーは含まれない(キーはヘッダーで送る)。
+async function fetchRetry(url, opts, tries = 3) {
+  for (let t = 1; ; t++) {
+    const res = await fetch(url, opts);
+    if (res.ok) return res;
+    if (t < tries && (res.status === 429 || res.status >= 500)) { await new Promise(r => setTimeout(r, 1500 * t)); continue; }
+    throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+  }
+}
+
+async function geminiRead(cfg, dataUrl) {
+  const [head, b64] = dataUrl.split(",");
+  const body = {
+    contents: [{ parts: [{ inline_data: { mime_type: head.slice(5, head.indexOf(";")), data: b64 } }, { text: GEMINI_PROMPT }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_SCHEMA, temperature: 0 },
+  };
+  const res = await fetchRetry(`https://generativelanguage.googleapis.com/v1beta/models/${cfg.model}:generateContent`,
+    { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.geminiKey }, body: JSON.stringify(body) });
+  return JSON.parse((await res.json()).candidates[0].content.parts[0].text);
+}
+
+// PokéWallet を「英語名 番号」で検索する。番号が一致し、名前が読み取った英語名で始まるものだけを返す。
+// セット記号は小さくて誤読しやすいので、検索には使わない(複数件のときの絞り込みにだけ使う)。
+async function findCards(cfg, nameEn, number, setCode) {
+  const res = await fetchRetry(`https://api.pokewallet.io/search?q=${encodeURIComponent(nameEn + " " + number)}&limit=10`,
+    { headers: { "X-API-Key": cfg.pokewalletKey } });
+  let hits = ((await res.json()).results || []).filter(c =>
+    c.card_info.card_number === number && (c.card_info.name || "").toLowerCase().startsWith(nameEn.toLowerCase()));
+  if (hits.length > 1 && setCode) {
+    const f = hits.filter(c => (c.card_info.set_code || "").toLowerCase() === setCode.toLowerCase());
+    if (f.length) hits = f;
+  }
+  return hits;
+}
+
+async function usdJpy() {
+  const res = await fetchRetry("https://api.frankfurter.dev/v1/latest?base=USD&symbols=JPY", {});
+  return (await res.json()).rates.JPY;
+}
+
+// 1 枚分: 読み取り -> 照会 -> 価格。結果は rec に書く。
+async function fillRecord(cfg, rec, dataUrl, rate) {
+  const read = rec.read = await geminiRead(cfg, dataUrl);
+  if (!read.name_en || !read.number) { rec.status = "unread"; rec.note = "英語名または番号を読み取れない"; return; }
+  if (read.confidence < MIN_CONFIDENCE) { rec.status = "low_confidence"; rec.note = "読み取りの信頼度が低い"; return; }
+  const hits = await findCards(cfg, read.name_en, read.number, read.set_code);
+  if (!hits.length) { rec.status = "not_found"; rec.note = "PokéWallet に該当なし(番号の誤読の可能性)"; return; }
+  if (hits.length > 1) { rec.status = "ambiguous"; rec.note = `候補が ${hits.length} 件ある`; return; }
+  const c = hits[0], ci = c.card_info;
+  rec.match = {
+    id: c.id, set_code: ci.set_code, set_name: ci.set_name, card_number: ci.card_number, name: ci.name,
+    rarity: ci.rarity ?? null, tcgplayer_url: c.tcgplayer?.url ?? null, cardmarket_url: c.cardmarket?.product_url ?? null,
+  };
+  const prices = (c.tcgplayer?.prices || []).filter(p => p.market_price != null);
+  if (!prices.length) { rec.status = "no_price"; rec.note = "市場価格なし"; return; }
+  const yen = usd => rate ? Math.round(usd * rate) : null;
+  rec.price = {
+    jpy: yen(prices[0].market_price), usd: prices[0].market_price, variant: prices[0].sub_type_name, usd_jpy: rate,
+    variants: prices.map(p => ({ name: p.sub_type_name, usd: p.market_price, jpy: yen(p.market_price) })),
+    source: "TCGplayer (via PokéWallet)",
+  };
+  rec.status = "ok";
+  if (!rate) rec.note = "為替レートを取得できず、円に換算できない";
+}
+
+// 枠の下に重ねる表示用
+function updateInfo(i) {
+  const r = STATE.records[i];
+  if (r.status === "pending" || r.status === "running") return;
+  STATE.info[i] = {
+    name: r.read?.name_ja, number: r.read?.number, rarity: r.read?.rarity_mark || r.match?.rarity || "",
+    price: r.status === "ok" ? r.price.jpy : undefined,
+  };
+}
+
+// --- 設定: タグの値 (FileMaker が置換) か、ブラウザ単体では入力欄 ---
+function config() {
+  const tag = id => { const s = document.getElementById(id).textContent.trim(); return /^__\w+__$/.test(s) ? "" : s; };
+  const ui = id => { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
+  return {
+    geminiKey: tag("geminiKey") || ui("uiGemini"), pokewalletKey: tag("pokewalletKey") || ui("uiPokewallet"),
+    model: tag("geminiModel") || DEFAULT_MODEL,
+  };
+}
+
+// --- ボタン 2: カード情報の取得を始める ---
+// 非同期で動く。すぐに文字列を返す。進み具合は getStatus()。取得した結果は、getJSON() を呼んだときに FileMaker へ渡す。
+window.lookupAll = function () {
+  if (!STATE.img) return "error:no image";
+  if (!STATE.cards.length) return "error:no cards";
+  if (RUN.state === "running") return "busy";
+  const cfg = config();
+  if (!cfg.geminiKey || !cfg.pokewalletKey) return "error:no api key";
+  runAll(cfg);
+  return "started:" + STATE.cards.length;
+};
+
+async function runAll(cfg) {
+  RUN = { state: "running", total: STATE.cards.length, done: 0, error: "", rate: null };
+  initRecords(); STATE.info = {}; showBar(); draw();
+  try { RUN.rate = await usdJpy(); } catch (e) { /* 取れなければ円に換算しない (USD は残る) */ }
+  await Promise.all(STATE.cards.map(async (card, i) => {
+    const rec = STATE.records[i]; rec.status = "running";
+    try { await fillRecord(cfg, rec, cropCard(card), RUN.rate); }
+    catch (e) { rec.status = "error"; rec.note = String(e.message || e).slice(0, 200); }
+    RUN.done++; updateInfo(i); draw(); showBar();
+  }));
+  RUN.state = "done"; showBar();
+}
+
+// --- ボタン 3 (FileMaker 側でデータ作成): ここから JSON を受け取る ---
+window.getStatus = () => JSON.stringify({ state: RUN.state, total: RUN.total, done: RUN.done, error: RUN.error });
+function buildJson() {
+  return JSON.stringify({
+    version: 1, created_at: new Date().toISOString(), state: RUN.state, usd_jpy: RUN.rate,
+    image: STATE.img ? { width: STATE.img.naturalWidth, height: STATE.img.naturalHeight } : null,
+    cards: STATE.records,
+  });
+}
+
+// ボタン 3: 取得結果の JSON を FileMaker のスクリプト "callback" にパラメータで渡す (オプション 0 = 続行)。
+// 同じ JSON を戻り値にも返す(Perform JavaScript の結果としても読める。ブラウザ単体の確認用)。
+// 取得の途中で呼ぶと、未完了のカードは status が pending / running のまま入る。
+window.getJSON = function () {
+  const json = buildJson();
+  if (typeof FileMaker !== "undefined") FileMaker.PerformScriptWithOption(CALLBACK_SCRIPT, json, "0");
+  return json;
+};
+
+// 検出した各カードを元画像の解像度で切り出す (AI に渡す用)。[{index, confidence, image}] の JSON 文字列。
+window.getCrops = function (margin = 0.08, maxSide = 1024) {
+  if (!STATE.img) return JSON.stringify([]);
+  return JSON.stringify(STATE.cards.map((c, i) => ({ index: i, confidence: c.c, image: cropCard(c, margin, maxSide) })));
+};
+
+// 外から表示だけを差し替える。引数: [{index, name, number, rarity, price}, ...]  price は円(数値)。無ければ「要確認」
+window.setCardInfo = function (infos) {
+  const list = typeof infos === "string" ? JSON.parse(infos) : infos;
+  STATE.info = {};
+  for (const it of list) STATE.info[it.index] = it;
+  if (STATE.img) draw();
+  return "ok";
+};
+
+// 実機(Web ビューア)から外部 API に届くかの確認。非同期。結果は getSelfTest() で読む。
+let SELFTEST = { state: "idle" };
+window.selfTest = function () {
+  const cfg = config(), r = SELFTEST = { state: "running" };
+  const run = async (name, f) => { try { r[name] = await f(); } catch (e) { r[name] = "NG " + (e.message || e); } };
+  Promise.all([
+    run("frankfurter", async () => "OK " + await usdJpy()),
+    run("pokewallet", async () => (await findCards(cfg, "Pikachu", "019/103", "")).length ? "OK" : "NG 該当なし"),
+    run("gemini", async () => { await fetchRetry("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", { headers: { "x-goog-api-key": cfg.geminiKey } }); return "OK"; }),
+  ]).then(() => { r.state = "done"; });
+  return "started";
+};
+window.getSelfTest = () => JSON.stringify(SELFTEST);
+
+// --- 画面: 進み具合 ---
+function showBar() {
+  const bar = document.getElementById("bar");
+  if (RUN.state === "idle") { bar.style.display = "none"; return; }
+  const bad = STATE.records.filter(r => !["ok", "pending", "running"].includes(r.status)).length;
+  bar.textContent = RUN.state === "running" ? `カード情報を取得中 ${RUN.done}/${RUN.total}` : `取得完了 ${RUN.total - bad}/${RUN.total} 件` + (bad ? `(要確認 ${bad} 件)` : "");
+  bar.style.display = "block";
+}
+
+// --- 画面: 枠をタップしたときのフローティングウィンドウ ---
+const STATUS_LABEL = {
+  pending: "未取得", running: "取得中", ok: "取得済み", unread: "読み取れない", low_confidence: "読み取りの信頼度が低い",
+  not_found: "該当なし", ambiguous: "候補が複数", no_price: "価格なし", error: "エラー",
+};
+
+function hidePopup() { document.getElementById("pop").style.display = "none"; }
+
+function showPopup(i, clientX, clientY) {
+  const rec = STATE.records[i], pop = document.getElementById("pop");
+  pop.textContent = "";
+  pop.style.borderColor = COLORS[i % COLORS.length];
+  const add = (text, cls, tag = "div") => { const el = document.createElement(tag); el.textContent = text; if (cls) el.className = cls; pop.appendChild(el); return el; };
+  add("×", "x", "span").onclick = hidePopup;
+  const r = rec.read, m = rec.match, p = rec.price;
+  add(r?.name_ja || `カード ${i}`, "", "h3");
+  if (rec.status !== "ok") add(STATUS_LABEL[rec.status] || rec.status, "warn");
+  if (r) add([r.number, r.rarity_mark || m?.rarity].filter(Boolean).join("  "));
+  if (m) add(`${m.set_name || ""} [${m.set_code}]`, "sub");
+  if (p) {
+    add(p.jpy != null ? `¥${p.jpy.toLocaleString()}` : "円に換算できません", "price");
+    add(`$${p.usd}  ${p.variant}` + (p.usd_jpy ? `  @${p.usd_jpy}円/$` : ""), "sub");
+    add(p.source, "sub");
+  }
+  if (rec.note) add(rec.note, "warn");
+  if (rec.box.conf != null) add(`検出の確信度 ${rec.box.conf.toFixed(2)}`, "sub");
+  pop.style.display = "block";
+  pop.style.left = Math.max(8, Math.min(clientX + 12, window.innerWidth - pop.offsetWidth - 8)) + "px";
+  pop.style.top = Math.max(8, Math.min(clientY + 12, window.innerHeight - pop.offsetHeight - 8)) + "px";
+}
+
+// タップした位置を含む枠を探す。重なっていれば、小さいほうを優先する。
+document.getElementById("c").addEventListener("pointerup", e => {
+  if (!STATE.img) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
+  let best = -1, bestArea = Infinity;
+  STATE.cards.forEach((c, i) => {
+    const area = (c.x2 - c.x1) * (c.y2 - c.y1);
+    if (nx >= c.x1 && nx <= c.x2 && ny >= c.y1 && ny <= c.y2 && area < bestArea) { best = i; bestArea = area; }
+  });
+  if (best >= 0) showPopup(best, e.clientX, e.clientY); else hidePopup();
+});
 
 if (IMAGE.startsWith("data:")) {
   render(IMAGE, RESULT);
@@ -77,10 +423,21 @@ if (IMAGE.startsWith("data:")) {
   // 単体テスト用 UI
   document.getElementById("tools").style.display = "block";
   let src = null;
-  document.getElementById("file").onchange = e => {
+  const $ = id => document.getElementById(id);
+  $("file").onchange = e => {
     const r = new FileReader(); r.onload = () => { src = r.result; }; r.readAsDataURL(e.target.files[0]);
   };
-  document.getElementById("run").onclick = () => src && render(src, document.getElementById("json").value);
+  $("run").onclick = () => src && render(src, $("json").value);
+  $("lookup").onclick = () => { $("out").value = lookupAll(); };
+  $("dump").onclick = () => { $("out").value = JSON.stringify(JSON.parse(buildJson()), null, 2); };
+  $("selftest").onclick = () => { selfTest(); setTimeout(() => { $("out").value = JSON.stringify(JSON.parse(getSelfTest()), null, 2); }, 4000); };
+  $("apply").onclick = () => setCardInfo($("info").value);
+  $("crops").onclick = () => {
+    const v = $("cropview"); v.textContent = "";
+    for (const c of JSON.parse(getCrops())) {
+      const im = new Image(); im.src = c.image; im.style.cssText = "height:160px;margin:4px"; v.appendChild(im);
+    }
+  };
 }
 </script>
 </body>
